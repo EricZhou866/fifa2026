@@ -7,107 +7,97 @@
 //                  the GSPS private attribute
 //  POSTCONDITIONS  none (read only)
 //  NOTES:          RSP-10349 - when a study is transferred between archive
-//                  contexts the image UIDs can be coerced: the standard GSPS
-//                  reference sequences are rewritten but the annotation
-//                  server serialized in the private attribute still
-//                  references the original UIDs. Such a server deserializes
-//                  successfully, yet none of its annotations resolve to an
-//                  image of the current study, so nothing is displayed.
-//                  Returns false only for that unambiguous case: the server
-//                  references at least one image and NONE of the referenced
-//                  images exist in the GSPS. Partial overlap and image-less
-//                  (study/global scoped) servers are accepted so healthy
-//                  studies keep the exact same behaviour.
+//                  contexts the image UIDs can be coerced: the standard
+//                  GSPS reference sequences are rewritten but the
+//                  annotation server serialized in the private attribute
+//                  still references the original UIDs. Such a server
+//                  deserializes successfully, yet none of its annotations
+//                  resolve to an image of the current study, so nothing is
+//                  displayed.
+//                  The check reuses the server's own scope matching: for
+//                  each image referenced by the GSPS, ask every
+//                  deserialized scoped collection whether it applies to
+//                  that image (IncludeScope - same test
+//                  UpdateLinksForScopedCollection uses to connect output
+//                  collections - complemented by the image-level equality
+//                  FindScopedCollection uses). Stale only when not a
+//                  single GSPS image matches a single collection, so
+//                  healthy studies keep the exact same behaviour.
 //==============================================================================
 bool
 CAliANServerC::InternalServerMatchesGSPSReferences( const CAliDSGSPSC2* ipGSPS )
 //==============================================================================
 {
-    //--------------------------------------------------
-    // collect the image UIDs referenced by the
-    // deserialized annotations (the scopes stored with
-    // each scoped collection)
-    //--------------------------------------------------
-    set< string > serverImageUIDs;
-
-    ScopedCollectionMapIterator it = m_ScopedCollectionMap.begin();
-
-    while ( it != m_ScopedCollectionMap.end() )
-    {
-        CScopedCollectionC* pScopedCollection = (*it).second;
-
-        if ( pScopedCollection != 0 )
-        {
-            // VERIFY (1): accessor returning the scope copy held by the
-            // scoped collection - same one FindScopedCollection() uses
-            CAliIPPScopeC* pScope = pScopedCollection->GetScope();
-
-            if ( pScope != 0 )
-            {
-                // VERIFY (2): element enumeration API of CAliIPPScopeC
-                for ( int s = 0; s < pScope->GetScopeElementCount(); ++s )
-                {
-                    const CAliIPPScopeElementC* pElement = pScope->GetScopeElement( s );
-
-                    if ( pElement != 0 )
-                    {
-                        //--------------------------------------------------
-                        // scope item 2 is the image level - same convention
-                        // as IsImageUIDInScope() / MakeScopeElement()
-                        //--------------------------------------------------
-                        const CAliIPPImageIDC* pImageID =
-                            dynamic_cast< const CAliIPPImageIDC* >( pElement->GetScopeItem( 2, false ) );
-
-                        if ( ( pImageID != 0 ) && ( pImageID->GetStringIDPtr() != 0 ) )
-                        {
-                            serverImageUIDs.insert( pImageID->GetStringIDPtr() );
-                        }
-                    }
-                }
-            }
-        }
-
-        ++it;
-    }
-
-    if ( serverImageUIDs.empty() )
+    if ( m_ScopedCollectionMap.empty() )
     {
         //--------------------------------------------------
-        // no image-scoped annotations - nothing to cross
-        // check, accept the deserialized server
+        // deserialized server holds no annotations -
+        // nothing to cross check (and nothing that could
+        // be displayed); keep the previous behaviour
         //--------------------------------------------------
         return true;
     }
 
     //--------------------------------------------------
-    // collect the image UIDs referenced by the GSPS
-    // itself (the standard reference sequences, which
-    // UID coercion rewrites correctly)
+    // the image references of the GSPS itself - the
+    // standard reference sequences, which UID coercion
+    // rewrites correctly
+    // (elements are non owning - ConvertGSPS does not
+    // free them either)
     //--------------------------------------------------
     ImageUIDToScopeMap scopesMap;
 
-    if ( !ipGSPS->GetScopes( scopesMap ) )
+    if ( !ipGSPS->GetScopes( scopesMap ) || scopesMap.empty() )
     {
         //--------------------------------------------------
         // cannot verify - accept the deserialized server
-        // so behaviour does not change on this error path
+        // so these paths behave exactly as before
         //--------------------------------------------------
         return true;
     }
 
-    //--------------------------------------------------
-    // stale if none of the annotation references
-    // resolve to an image of this GSPS
-    // (scopesMap elements are non owning - ConvertGSPS
-    // does not free them either)
-    //--------------------------------------------------
     for ( ImageUIDToScopeMap::const_iterator cIter = scopesMap.begin();
           cIter != scopesMap.end();
           ++cIter )
     {
-        if ( serverImageUIDs.find( cIter->first ) != serverImageUIDs.end() )
+        CAliIPPScopeElementC* pReferenceScope = cIter->second;
+
+        if ( pReferenceScope == 0 )
         {
-            return true;
+            continue;
+        }
+
+        unique_ptr< CAliIPPScopeCollectionC > pImageScope(
+            ConvertScopeElementToScopeCollection( pReferenceScope ) );
+
+        if ( pImageScope.get() == 0 )
+        {
+            continue;
+        }
+
+        //--------------------------------------------------
+        // does any deserialized scoped collection apply to
+        // this image of the GSPS?
+        //--------------------------------------------------
+        ScopedCollectionMapIterator it = m_ScopedCollectionMap.begin();
+
+        while ( it != m_ScopedCollectionMap.end() )
+        {
+            CScopedCollectionC* pScopedCollection = (*it).second;
+
+            if ( pScopedCollection != 0 )
+            {
+                CAliIPPScopeC* pCollectionScope = pScopedCollection->GetScope();
+
+                if ( pScopedCollection->IncludeScope( pImageScope.get() ) ||
+                     ( ( pCollectionScope != 0 ) &&
+                       pCollectionScope->IsEqual( pImageScope.get(), 2 ) ) )
+                {
+                    return true;
+                }
+            }
+
+            ++it;
         }
     }
 
@@ -115,9 +105,9 @@ CAliANServerC::InternalServerMatchesGSPSReferences( const CAliDSGSPSC2* ipGSPS )
 }
 
 
-================================================================================
-3) AliANServerC.cpp - full replacement of Deserialize4() (lines 3819-3903)
-================================================================================
+//==============================================================================
+// 3) AliANServerC.cpp - full replacement of Deserialize4() (lines 3819-3903)
+//==============================================================================
 
 //------------------------------------------------------------------------------
 bool CAliANServerC::Deserialize4( const CAliIPGSPS2* cipIPGSPS )
